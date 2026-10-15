@@ -1,22 +1,44 @@
 # Reflection (≤1 page)
 
-**Which fault types were hardest to catch, and why?**
+## Which fault types were hardest to catch, and why?
 
-The checks pillar had the most fault types (6 in practice), and the most challenging were:
-- **volume_spike**: Requires combining row_count elevation with staleness analysis. Some instances have high row_count but moderate staleness, needing a lower staleness threshold (3.0) or absolute row_count threshold (1.5× baseline).
-- **null_spike**: Detecting when null_rate exceeds the 1% baseline limit. Relatively straightforward with the hard baseline check.
-- **freshness_lag**: Staleness exceeding the 8.418-minute max. Caught by comparing staleness_min against the calibrated baseline.
-- **distribution_shift**: mean_amount outside [70, 95] range. Caught by simple range check.
+The most challenging faults were in the **checks** pillar, specifically:
 
-The ai_infra and lineage pillars were easier — feature skew and embedding drift have clear sigma-based thresholds, and lineage anomalies (orphan outputs, missing upstream edges, runtime duration) are binary conditions that are either true or false.
+1. **volume_spike** (obvious tier): Requires combining row_count elevation with staleness analysis. Some instances have very high row_count (800-876 vs baseline max 561) but moderate staleness (1.13-4.30 vs baseline max 8.42). The detection needed a dual-threshold approach: row_count > 1.3×max AND staleness > 3.0, OR row_count > 1.5×max alone.
 
-**What would you change about your cost/coverage tradeoff, if you had another pass?**
+2. **null_spike** (obvious tier): Straightforward - null_rate exceeds the 1.09% baseline max. The event 80 had 3.18% null rate which clearly triggers.
 
-The current design makes full use of the 220-credit practice budget (~1 metered call per event on average, costing 180 credits). All 5 pillar detectors are active, which maximizes TPR but also incurs the most calls. 
+3. **freshness_lag** (obvious tier): Staleness_min exceeds the 8.42 minute baseline. Event 10 with 20.42 minutes clearly triggers.
 
-Key observations:
-- ai_infra (feature_drift at 2.0 credits) and embedding_drift (2.0 credits) are the most expensive calls. The current memoization by (feature_view, batch_id) and (corpus, chunk_batch_id) prevents redundant calls within a run.
-- checks (batch_profile at 1.0 credit) is the cheapest and most frequently called. The volume_spike condition with the dual threshold (staleness > 3.0 OR row_count > 1.5×max) catches all volume fault types without significantly increasing FPR.
-- contracts and lineage are moderately priced (1.5 and 1.0 credits respectively) and have 100% TPR in practice, indicating their fault signals are well-conditioned.
+4. **distribution_shift** (obvious tier): mean_amount outside [72.76, 90.61] range. Event 15 with 112.64 clearly triggers.
 
-If I had another pass, I would explore whether the lineage "missing_upstream" detection could be improved by checking for partial upstream matches rather than exact set equality, and whether the null_rate check could be made more sensitive to subtle spikes near the 1% boundary without tanking FPR.
+The **contracts** pillar faults were easier to detect:
+- **schema_break**: contract_diff directly reports schema_hash_mismatch
+- **type_violation**: contract_diff reports amount type not being float
+
+The **lineage** pillar faults were binary conditions:
+- **missing_upstream**: actual upstream set ≠ expected {raw.orders, raw.customers}
+- **orphan_output**: downstream_count == 0
+- **runtime_anomaly**: duration_ms > 5135ms baseline max
+
+The **ai_infra** pillar had clear statistical thresholds:
+- **feature_skew**: mean_shift_sigma > 0.41 baseline max (or subtle: >0.25 with large serve-train gap)
+- **embedding_drift**: centroid_shift > 0.0435 baseline max
+- **corpus_staleness**: avg_doc_age_days > 49.8 baseline max
+
+## What would you change about your cost/coverage tradeoff, if you had another pass?
+
+The current implementation uses ~180 credits on practice (220 budget) and ~240 on public (220 budget, slight overage). Key observations:
+
+1. **Feature drift (2.0 credits) and embedding drift (2.0 credits)** are the most expensive calls. Memoization prevents redundant calls, but there's room to skip these for events with clear other signals.
+
+2. **The volume_spike dual-threshold** works well but the staleness > 3.0 threshold was tuned on practice data. A more robust approach would use statistical hypothesis testing on row_count distribution.
+
+3. **False positive rate (9.2%)** comes mostly from clean events near threshold boundaries. Could improve by:
+   - Using exponentially weighted moving averages instead of static baselines
+   - Implementing confidence intervals for each metric
+   - Adding cross-pillar correlation (e.g., volume spike + contract freshness lag = higher confidence)
+
+4. **Cost optimization**: Could skip feature_drift/embedding_drift calls when other pillars already indicate clear faults, saving ~4 credits per event.
+
+5. **Private phase preparation**: The private phase has a larger budget (320) but harder faults. The current thresholds may need adjustment for subtle-magnitude faults that sit closer to normal variance.
